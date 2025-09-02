@@ -23,17 +23,17 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # Groq only
-GROQ_KEY = os.getenv("GROQ_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # безопасная дефолтная модель
+GROQ_KEY   = os.getenv("GROQ_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # безопасный дефолт
 
 # Limits & memory
-FREE_LIMIT   = int(os.getenv("FREE_LIMIT", "100"))
-VIP_DAYS     = int(os.getenv("VIP_DAYS", "30"))  # на будущее
-DB_PATH      = os.getenv("DB_PATH", "mila.db")
-HISTORY_LEN  = int(os.getenv("HISTORY_LEN", "20"))
+FREE_LIMIT  = int(os.getenv("FREE_LIMIT", "100"))
+VIP_DAYS    = int(os.getenv("VIP_DAYS", "30"))  # на будущее
+DB_PATH     = os.getenv("DB_PATH", "mila.db")
+HISTORY_LEN = int(os.getenv("HISTORY_LEN", "6"))  # короче для надёжности
 
 # 2h reminders
-REMINDER_DELAY = 2 * 60 * 60       # 2 часа в секундах
+REMINDER_DELAY = 2 * 60 * 60       # 2 часа
 REMINDER_TEXTS = [
     "Я тут 🌸 Давно не писала... как ты? 💕",
     "Хочу услышать тебя 🤍 Как настроение?",
@@ -138,62 +138,73 @@ def clear_history(user_id: int):
     with db_conn() as conn:
         conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
 
+# ---------- Helpers for Groq ----------
+def trim_messages(messages, max_chars=8000):
+    cleaned = []
+    for m in messages or []:
+        if not m or "role" not in m or "content" not in m:
+            continue
+        c = (m["content"] or "").strip()
+        if c and m["role"] in ("system", "user", "assistant"):
+            cleaned.append({"role": m["role"], "content": c})
+    total = sum(len(m["content"]) for m in cleaned)
+    # режем с начала (сохраняем system и последний user/assistant)
+    while total > max_chars and len(cleaned) > 3:
+        removed = cleaned.pop(1)
+        total -= len(removed["content"])
+    return cleaned
+
 # ---------- Groq (LLM) ----------
 def ask_groq(messages):
     if not GROQ_KEY:
         return "Не хватает ключа Groq (GROQ_KEY) 🙈"
 
-    # Очистка входа от мусора/None/пустых
-    clean = []
-    for m in messages or []:
-        if not m:
-            continue
-        role = m.get("role")
-        content = m.get("content")
-        if role in ("system", "user", "assistant") and isinstance(content, str) and content.strip():
-            clean.append({"role": role, "content": content.strip()})
-    if not any(m["role"] == "user" for m in clean):
-        clean.append({"role": "user", "content": "Привет!"})
+    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+    model = os.getenv("GROQ_MODEL", GROQ_MODEL)
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_KEY}",
-        "Content-Type": "application/json"
+    # 1) чистим и обрезаем
+    clean = trim_messages(messages, max_chars=8000)
+    payload = {
+        "model": model,
+        "messages": clean,
+        "temperature": 0.6,
+        "top_p": 0.9,
+        "max_tokens": 256
     }
 
-    # fallback-лист моделей
-    candidates = [
-        os.getenv("GROQ_MODEL", GROQ_MODEL),
-        "llama-3.1-8b-instant",
-        "llama-3.1-70b-versatile"
-    ]
+    try:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=45)
+        if r.status_code == 400:
+            # 2) лог точной причины
+            logger.error("Groq 400 details (full): %s", r.text)
+            # 3) фолбэк: минимальный запрос (system + последний user)
+            user_text = ""
+            for m in reversed(clean):
+                if m["role"] == "user":
+                    user_text = m["content"]
+                    break
+            if not user_text:
+                user_text = "Привет!"
+            mini = {
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text}
+                ],
+                "temperature": 0.6, "top_p": 0.9, "max_tokens": 256
+            }
+            r2 = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=mini, timeout=45)
+            if r2.status_code == 400:
+                logger.error("Groq 400 details (mini): %s", r2.text)
+                return "Я немного споткнулась 🙈 Сократи, пожалуйста, сообщение и попробуем ещё раз."
+            r2.raise_for_status()
+            return r2.json()["choices"][0]["message"]["content"].strip()
 
-    last_err_text = ""
-    for model in candidates:
-        payload = {
-            "model": model,
-            "messages": clean,
-            "temperature": 0.6,
-            "top_p": 0.9,
-            "max_tokens": 320
-        }
-        for attempt in range(2):
-            try:
-                r = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers, json=payload, timeout=45
-                )
-                if r.status_code == 400:
-                    last_err_text = r.text  # покажем, что именно не понравилось API
-                    break  # пробуем следующую модель
-                r.raise_for_status()
-                return r.json()["choices"][0]["message"]["content"].strip()
-            except requests.RequestException as e:
-                last_err_text = getattr(e.response, "text", str(e))
-                time.sleep(1.0 * (attempt + 1))
-        # следующая модель, если 400/ошибка
-
-    logger.error("Groq 400/Request error. Details: %s", last_err_text)
-    return "Немного замешкалась 🙈 Кажется, модель занята или запрос ей не понравился. Попробуем ещё раз?"
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except requests.RequestException as e:
+        logger.exception("Groq request error: %s", getattr(e.response, "text", str(e)))
+        return "Немного замешкалась 🙈 Давай ещё раз?"
 
 # ---------- Reminders ----------
 async def check_inactive(context: ContextTypes.DEFAULT_TYPE):
@@ -205,7 +216,7 @@ async def check_inactive(context: ContextTypes.DEFAULT_TYPE):
             try:
                 msg = random.choice(REMINDER_TEXTS)
                 await context.bot.send_message(chat_id=uid, text=msg)
-                touch_user(uid)  # чтобы не спамила каждую проверку
+                touch_user(uid)  # чтобы не спамила
             except Exception as e:
                 logger.warning("Не удалось написать %s: %s", uid, e)
 
@@ -278,7 +289,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text or ""
 
-    touch_user(user_id)  # обновим last_msg_at
+    touch_user(user_id)
 
     if not is_vip(user_id):
         if free_left(user_id) <= 0:
@@ -320,7 +331,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
-    # Периодическая проверка «молчаливых» пользователей
+    # Периодические напоминания
     job_queue: JobQueue = app.job_queue
     job_queue.run_repeating(check_inactive, interval=600, first=60)
 
