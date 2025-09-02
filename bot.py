@@ -331,9 +331,13 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
-    # Периодические напоминания
-    job_queue: JobQueue = app.job_queue
-    job_queue.run_repeating(check_inactive, interval=600, first=60)
+       # Периодические напоминания
+    job_queue = app.job_queue
+    if job_queue is not None:
+        job_queue.run_repeating(check_inactive, interval=600, first=60)
+    else:
+        logger.warning("JobQueue недоступен (нет extra 'job-queue'). Напоминания временно отключены.")
+
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
