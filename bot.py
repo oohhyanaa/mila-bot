@@ -21,23 +21,13 @@ logger = logging.getLogger(__name__)
 # -------- ENV --------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Провайдер LLM: 'groq' (рекомендуется для бесплатного теста) или 'deepseek'
-PROVIDER = os.getenv("PROVIDER", "deepseek").lower()
-
-# DeepSeek
-DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-
-# Groq
+# Только Groq
 GROQ_KEY = os.getenv("GROQ_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# Ограничения/монетизация
+# Ограничения/монетизация (VIP пока не используем, но оставлю задел)
 FREE_LIMIT = int(os.getenv("FREE_LIMIT", "10"))
-VIP_DAYS = int(os.getenv("VIP_DAYS", "30"))
-PAYMENT_LINK = os.getenv("PAYMENT_LINK", "https://t.me/CryptoBot")
-
-# Память
+VIP_DAYS = int(os.getenv("VIP_DAYS", "30"))  # на будущее
 DB_PATH = os.getenv("DB_PATH", "mila.db")
 HISTORY_LEN = int(os.getenv("HISTORY_LEN", "12"))
 
@@ -131,54 +121,35 @@ def clear_history(user_id: int):
     with db_conn() as conn:
         conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
 
-# ---------- LLM Providers ----------
-def ask_deepseek(messages):
-    if not DEEPSEEK_KEY:
-        return "Нужен DEEPSEEK_KEY для DeepSeek 🙈"
-    headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}"}
-    payload = {"model": DEEPSEEK_MODEL, "messages": messages}
-    r = requests.post("https://api.deepseek.com/chat/completions", headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
-
+# ---------- LLM (Groq) ----------
 def ask_groq(messages):
     if not GROQ_KEY:
-        return "Нужен GROQ_KEY для Groq 🙈"
+        return "Не хватает ключа Groq (GROQ_KEY) 🙈 Добавь его в переменные окружения на хостинге."
     headers = {"Authorization": f"Bearer {GROQ_KEY}"}
     payload = {"model": GROQ_MODEL, "messages": messages}
-    r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
-
-def ask_llm(messages):
     try:
-        if PROVIDER == "groq":
-            return ask_groq(messages)
-        else:
-            return ask_deepseek(messages)
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers, json=payload, timeout=60
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
     except requests.HTTPError as e:
-        logger.exception("LLM HTTP error: %s", e)
+        logger.exception("Groq HTTP error: %s", e)
         code = e.response.status_code if e.response is not None else None
-        if code == 402:
-            return "Похоже, на аккаунте закончились кредиты для ИИ 😅 Попробуешь ещё раз позже?"
-        return "У меня небольшая сетевая заминка 🙈 Давай попробуем ещё раз?"
+        if code == 401 or code == 403:
+            return "Ключ Groq отклонён (401/403). Проверь правильность GROQ_KEY."
+        return "Немного замешкалась из-за сети 🙈 Давай попробуем ещё раз?"
     except Exception as e:
-        logger.exception("LLM error: %s", e)
-        return "Немного замешкалась 🙈 Повтори, пожалуйста?"
+        logger.exception("Groq error: %s", e)
+        return "У меня небольшая заминка 🙈 Повтори, пожалуйста?"
 
 # ---------- UI ----------
 def main_menu():
     kb = [
         [InlineKeyboardButton("💬 Чат", callback_data="chat")],
         [InlineKeyboardButton("🧹 Очистить историю", callback_data="clear_history")],
-        [InlineKeyboardButton("💕 VIP доступ", callback_data="vip")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-def vip_menu():
-    kb = [
-        [InlineKeyboardButton("Оплатить VIP", url=PAYMENT_LINK)],
-        [InlineKeyboardButton("Я оплатил(а) ✅", callback_data="vip_paid")],
+        [InlineKeyboardButton("🧾 Профиль", callback_data="profile_cb")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -209,7 +180,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ID: {uid}\n"
         f"Бесплатные сообщения: {used}/{FREE_LIMIT} (осталось {left})\n"
         f"История: храню последние {HISTORY_LEN} сообщений\n"
-        f"Провайдер ИИ: {PROVIDER}"
+        f"Модель: {GROQ_MODEL}"
     )
     await update.message.reply_text(msg)
 
@@ -217,24 +188,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     user_id = q.from_user.id
     data = q.data
-    if data == "vip":
-        await q.answer()
-        await q.edit_message_text(
-            "💕 VIP доступ: безлимитный чат, приоритетные ответы, сюрпризы от Милы.\n"
-            "Нажми «Оплатить VIP», а затем «Я оплатил(а) ✅».",
-            reply_markup=vip_menu()
-        )
-    elif data == "vip_paid":
-        set_vip(user_id)
-        await q.answer("VIP активирован на 30 дней 💕")
-        await q.edit_message_text("Готово! VIP активирован ✨ Пиши мне что угодно 💬")
-    elif data == "chat":
+    if data == "chat":
         await q.answer("Я здесь 😉")
         await q.message.reply_text("О чём поговорим? 🎬🎶")
     elif data == "clear_history":
         clear_history(user_id)
         await q.answer("История очищена 🧹")
         await q.message.reply_text("Начнём с чистого листа 🌸")
+    elif data == "profile_cb":
+        # Показать профиль по кнопке
+        uid, used, vip_until, created = get_user(user_id)
+        left = free_left(user_id)
+        msg = (
+            f"🧾 Профиль\n"
+            f"ID: {uid}\n"
+            f"Бесплатные сообщения: {used}/{FREE_LIMIT} (осталось {left})\n"
+            f"История: храню последние {HISTORY_LEN} сообщений\n"
+            f"Модель: {GROQ_MODEL}"
+        )
+        await q.answer()
+        await q.message.reply_text(msg)
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
@@ -248,37 +221,47 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         inc_free_used(user_id)
 
-    # Память
+    # Память + системный промпт
     hist = get_history(user_id, HISTORY_LEN)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + hist + [{"role": "user", "content": user_message}]
-    reply = ask_llm(messages)
+    reply = ask_groq(messages)
 
     add_message(user_id, "user", user_message)
     add_message(user_id, "assistant", reply)
     await update.message.reply_text(reply)
 
-# Доп. команды для тестов
+# Доп. команды
 async def reset_free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_free(update.effective_user.id)
     await update.message.reply_text("Лимит бесплатных сообщений сброшен 🔄")
-
-async def grant_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_vip(update.effective_user.id)
-    await update.message.reply_text("VIP активирован на 30 дней ✨")
 
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("Отсутствует TELEGRAM_TOKEN в переменных окружения")
     init_db()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        # Более устойчивые таймауты для Render
+        .connect_timeout(30)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(30)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("reset_free", reset_free_cmd))
-    app.add_handler(CommandHandler("grant_vip", grant_vip_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        poll_interval=2.0,
+        timeout=30,
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
     main()
