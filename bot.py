@@ -3,37 +3,44 @@ import logging
 import sqlite3
 import time
 import random
+import asyncio
 import requests
 from datetime import datetime, timedelta
+from typing import Dict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters, JobQueue
+    CallbackQueryHandler, ContextTypes, filters
 )
 
-# ---------- Logging ----------
+# ─────────────────────────  LOGGING  ─────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("mila-bot")
 
-# ---------- ENV ----------
+# ─────────────────────────  ENV  ─────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # Groq only
 GROQ_KEY   = os.getenv("GROQ_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # безопасный дефолт
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 # Limits & memory
-FREE_LIMIT  = int(os.getenv("FREE_LIMIT", "100"))
-VIP_DAYS    = int(os.getenv("VIP_DAYS", "30"))  # на будущее
-DB_PATH     = os.getenv("DB_PATH", "mila.db")
-HISTORY_LEN = int(os.getenv("HISTORY_LEN", "6"))  # короче для надёжности
+FREE_LIMIT   = int(os.getenv("FREE_LIMIT", "100"))
+VIP_DAYS     = int(os.getenv("VIP_DAYS", "30"))     # на будущее
+DB_PATH      = os.getenv("DB_PATH", "mila.db")
+HISTORY_LEN  = int(os.getenv("HISTORY_LEN", "4"))   # короче для скорости
 
-# 2h reminders
-REMINDER_DELAY = 2 * 60 * 60       # 2 часа
+# Performance knobs
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "1"))  # одновременно вызовов к ИИ
+GROQ_TIMEOUT    = int(os.getenv("GROQ_TIMEOUT", "25"))    # секунды
+
+# Optional reminders (off by default)
+ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "0") == "1"
+REMINDER_DELAY   = 2 * 60 * 60  # 2 часа
 REMINDER_TEXTS = [
     "Я тут 🌸 Давно не писала... как ты? 💕",
     "Хочу услышать тебя 🤍 Как настроение?",
@@ -54,7 +61,7 @@ EXAMPLE = [
     {"role": "assistant", "content": "Сочувствую 🤍 Хочешь, я просто побуду рядом и помогу выговориться? Что больше всего давит сейчас?"}
 ]
 
-# ---------- DB ----------
+# ─────────────────────────  DB  ─────────────────────────
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -101,14 +108,14 @@ def inc_free_used(user_id: int):
     with db_conn() as conn:
         conn.execute("UPDATE users SET free_used = free_used + 1 WHERE user_id=?", (user_id,))
 
+def reset_free(user_id: int):
+    with db_conn() as conn:
+        conn.execute("UPDATE users SET free_used=0 WHERE user_id=?", (user_id,))
+
 def set_vip(user_id: int, days: int = VIP_DAYS):
     until = int((datetime.utcnow() + timedelta(days=days)).timestamp())
     with db_conn() as conn:
         conn.execute("UPDATE users SET vip_until=? WHERE user_id=?", (until, user_id))
-
-def reset_free(user_id: int):
-    with db_conn() as conn:
-        conn.execute("UPDATE users SET free_used=0 WHERE user_id=?", (user_id,))
 
 def is_vip(user_id: int) -> bool:
     _, _, vip_until, _, _ = get_user(user_id)
@@ -138,8 +145,25 @@ def clear_history(user_id: int):
     with db_conn() as conn:
         conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
 
-# ---------- Helpers for Groq ----------
-def trim_messages(messages, max_chars=8000):
+# ─────────────────────────  CONCURRENCY (per-user)  ─────────────────────────
+USER_LOCKS: Dict[int, asyncio.Lock] = {}
+PENDING_MSG: Dict[int, str] = {}
+def get_lock(uid: int) -> asyncio.Lock:
+    if uid not in USER_LOCKS:
+        USER_LOCKS[uid] = asyncio.Lock()
+    return USER_LOCKS[uid]
+
+# ─────────────────────────  HTTP session with retries  ─────────────────────────
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+RETRY = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+SESSION = requests.Session()
+ADAPTER = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=RETRY)
+SESSION.mount("https://", ADAPTER)
+
+# ─────────────────────────  Helpers  ─────────────────────────
+def trim_messages(messages, max_chars=6000):
     cleaned = []
     for m in messages or []:
         if not m or "role" not in m or "content" not in m:
@@ -148,79 +172,53 @@ def trim_messages(messages, max_chars=8000):
         if c and m["role"] in ("system", "user", "assistant"):
             cleaned.append({"role": m["role"], "content": c})
     total = sum(len(m["content"]) for m in cleaned)
-    # режем с начала (сохраняем system и последний user/assistant)
     while total > max_chars and len(cleaned) > 3:
-        removed = cleaned.pop(1)
+        removed = cleaned.pop(1)  # режем самый ранний после system
         total -= len(removed["content"])
     return cleaned
 
-# ---------- Groq (LLM) ----------
-def ask_groq(messages):
+# ─────────────────────────  Groq (sync + async wrapper)  ─────────────────────────
+def ask_groq_sync(messages, model):
     if not GROQ_KEY:
         return "Не хватает ключа Groq (GROQ_KEY) 🙈"
-
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    model = os.getenv("GROQ_MODEL", GROQ_MODEL)
-
-    # 1) чистим и обрезаем
-    clean = trim_messages(messages, max_chars=8000)
     payload = {
         "model": model,
-        "messages": clean,
-        "temperature": 0.6,
-        "top_p": 0.9,
-        "max_tokens": 256
+        "messages": trim_messages(messages, max_chars=6000),
+        "temperature": 0.6, "top_p": 0.9, "max_tokens": 192
     }
+    r = SESSION.post("https://api.groq.com/openai/v1/chat/completions",
+                     headers=headers, json=payload, timeout=GROQ_TIMEOUT)
+    if r.status_code == 400:
+        logger.error("Groq 400 (full): %s", r.text[:500])
+        # минимальный фолбэк
+        user_text = next((m["content"] for m in reversed(payload["messages"]) if m["role"] == "user"), "Привет!")
+        mini = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                         {"role": "user", "content": user_text}],
+            "temperature": 0.6, "top_p": 0.9, "max_tokens": 192
+        }
+        r2 = SESSION.post("https://api.groq.com/openai/v1/chat/completions",
+                          headers=headers, json=mini, timeout=GROQ_TIMEOUT)
+        if r2.status_code == 400:
+            logger.error("Groq 400 (mini): %s", r2.text[:500])
+            return "Немного споткнулась 🙈 Напиши короче, пожалуйста?"
+        r2.raise_for_status()
+        return r2.json()["choices"][0]["message"]["content"].strip()
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"].strip()
 
-    try:
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=45)
-        if r.status_code == 400:
-            # 2) лог точной причины
-            logger.error("Groq 400 details (full): %s", r.text)
-            # 3) фолбэк: минимальный запрос (system + последний user)
-            user_text = ""
-            for m in reversed(clean):
-                if m["role"] == "user":
-                    user_text = m["content"]
-                    break
-            if not user_text:
-                user_text = "Привет!"
-            mini = {
-                "model": "llama-3.1-8b-instant",
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_text}
-                ],
-                "temperature": 0.6, "top_p": 0.9, "max_tokens": 256
-            }
-            r2 = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=mini, timeout=45)
-            if r2.status_code == 400:
-                logger.error("Groq 400 details (mini): %s", r2.text)
-                return "Я немного споткнулась 🙈 Сократи, пожалуйста, сообщение и попробуем ещё раз."
-            r2.raise_for_status()
-            return r2.json()["choices"][0]["message"]["content"].strip()
+LLM_SEM = asyncio.Semaphore(LLM_CONCURRENCY)
 
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except requests.RequestException as e:
-        logger.exception("Groq request error: %s", getattr(e.response, "text", str(e)))
-        return "Немного замешкалась 🙈 Давай ещё раз?"
+async def ask_groq(messages, model=None):
+    if model is None:
+        model = GROQ_MODEL
+    loop = asyncio.get_running_loop()
+    async with LLM_SEM:
+        return await loop.run_in_executor(None, lambda: ask_groq_sync(messages, model))
 
-# ---------- Reminders ----------
-async def check_inactive(context: ContextTypes.DEFAULT_TYPE):
-    now = int(time.time())
-    with db_conn() as conn:
-        rows = conn.execute("SELECT user_id, last_msg_at FROM users").fetchall()
-    for uid, last in rows:
-        if last and now - last > REMINDER_DELAY:
-            try:
-                msg = random.choice(REMINDER_TEXTS)
-                await context.bot.send_message(chat_id=uid, text=msg)
-                touch_user(uid)  # чтобы не спамила
-            except Exception as e:
-                logger.warning("Не удалось написать %s: %s", uid, e)
-
-# ---------- UI ----------
+# ─────────────────────────  UI  ─────────────────────────
 def main_menu():
     kb = [
         [InlineKeyboardButton("💬 Чат", callback_data="chat")],
@@ -229,7 +227,7 @@ def main_menu():
     ]
     return InlineKeyboardMarkup(kb)
 
-# ---------- Handlers ----------
+# ─────────────────────────  Handlers  ─────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
     user = update.effective_user
@@ -256,7 +254,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ID: {uid}\n"
         f"Бесплатные сообщения: {used}/{FREE_LIMIT} (осталось {left})\n"
         f"История: храню последние {HISTORY_LEN} сообщений\n"
-        f"Модель: {os.getenv('GROQ_MODEL', GROQ_MODEL)}"
+        f"Модель: {GROQ_MODEL}"
     )
     await update.message.reply_text(msg)
 
@@ -279,38 +277,77 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"ID: {uid}\n"
             f"Бесплатные сообщения: {used}/{FREE_LIMIT} (осталось {left})\n"
             f"История: храню последние {HISTORY_LEN} сообщений\n"
-            f"Модель: {os.getenv('GROQ_MODEL', GROQ_MODEL)}"
+            f"Модель: {GROQ_MODEL}"
         )
         await q.answer()
         await q.message.reply_text(msg)
 
+# ГЛАВНЫЙ хендлер — с «подхватом последнего» и блокировкой на пользователя
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
     user_id = update.effective_user.id
-    user_message = update.message.text or ""
+    user_message = (update.message.text or "").strip()
+    if not user_message:
+        return
 
-    touch_user(user_id)
+    await update.message.chat.send_action(action="typing")
 
-    if not is_vip(user_id):
-        if free_left(user_id) <= 0:
-            await update.message.reply_text("Пока бесплатные сообщения закончились 💛 Попробуем позже?")
-            return
-        inc_free_used(user_id)
+    lock = get_lock(user_id)
 
-    hist = get_history(user_id, HISTORY_LEN)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + EXAMPLE + hist + [{"role": "user", "content": user_message}]
-    reply = ask_groq(messages)
+    # если уже идёт ответ — запомним ПОСЛЕДНЕЕ сообщение и вежливо ответим
+    if lock.locked():
+        PENDING_MSG[user_id] = user_message
+        await update.message.reply_text("Секунду, допечатаю предыдущее и продолжу 💫")
+        return
 
-    add_message(user_id, "user", user_message)
-    add_message(user_id, "assistant", reply)
-    await update.message.reply_text(reply)
+    async with lock:
+        touch_user(user_id)
 
-# ---------- Extra cmds ----------
+        # лимиты
+        if not is_vip(user_id):
+            if free_left(user_id) <= 0:
+                await update.message.reply_text("Пока бесплатные сообщения закончились 💛 Попробуем позже?")
+                return
+            inc_free_used(user_id)
+
+        current_text = user_message
+        while True:
+            hist = get_history(user_id, HISTORY_LEN)
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + EXAMPLE + hist + [{"role": "user", "content": current_text}]
+            reply = await ask_groq(messages)
+
+            add_message(user_id, "user", current_text)
+            add_message(user_id, "assistant", reply)
+            await update.message.reply_text(reply)
+
+            # подхватить последнее сообщение, пришедшее пока печатали ответ
+            next_text = PENDING_MSG.pop(user_id, None)
+            if next_text:
+                current_text = next_text
+                await asyncio.sleep(0.1)
+                continue
+            break
+
+# Доп. команды
 async def reset_free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_free(update.effective_user.id)
     await update.message.reply_text("Лимит бесплатных сообщений сброшен 🔄")
 
-# ---------- Main ----------
+# ─────────────────────────  Reminders (optional)  ─────────────────────────
+async def check_inactive(context: ContextTypes.DEFAULT_TYPE):
+    now = int(time.time())
+    with db_conn() as conn:
+        rows = conn.execute("SELECT user_id, last_msg_at FROM users").fetchall()
+    for uid, last in rows:
+        if last and now - last > REMINDER_DELAY:
+            try:
+                msg = random.choice(REMINDER_TEXTS)
+                await context.bot.send_message(chat_id=uid, text=msg)
+                touch_user(uid)
+            except Exception as e:
+                logger.warning("Не удалось написать %s: %s", uid, e)
+
+# ─────────────────────────  MAIN  ─────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("Отсутствует TELEGRAM_TOKEN в переменных окружения")
@@ -318,12 +355,10 @@ def main():
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(60)
-        .write_timeout(60)
-        .pool_timeout(30)
+        .connect_timeout(30).read_timeout(60).write_timeout(60).pool_timeout(30)
         .build()
     )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("profile", profile))
@@ -331,18 +366,17 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
-       # Периодические напоминания
-    job_queue = app.job_queue
-    if job_queue is not None:
-        job_queue.run_repeating(check_inactive, interval=600, first=60)
+    # Напоминалки — включаются только если ENABLE_REMINDERS=1 и установлен extra job-queue
+    if ENABLE_REMINDERS and getattr(app, "job_queue", None) is not None:
+        app.job_queue.run_repeating(check_inactive, interval=600, first=60)
     else:
-        logger.warning("JobQueue недоступен (нет extra 'job-queue'). Напоминания временно отключены.")
-
+        if ENABLE_REMINDERS:
+            logger.warning("ENABLE_REMINDERS=1, но JobQueue недоступен (нужен пакет python-telegram-bot[job-queue]).")
 
     app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        poll_interval=2.0,
-        timeout=30,
+        allowed_updates=["message", "callback_query"],
+        poll_interval=3.0,
+        timeout=60,
         drop_pending_updates=True
     )
 
