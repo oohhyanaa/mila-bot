@@ -12,33 +12,40 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters, JobQueue
 )
 
-# -------- Logging --------
+# ---------- Logging ----------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# -------- ENV --------
+# ---------- ENV ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Только Groq
+# Groq only
 GROQ_KEY = os.getenv("GROQ_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # безопасная дефолтная модель
 
-# Ограничения
-FREE_LIMIT = int(os.getenv("FREE_LIMIT", "100"))
-VIP_DAYS = int(os.getenv("VIP_DAYS", "30"))
-DB_PATH = os.getenv("DB_PATH", "mila.db")
-HISTORY_LEN = int(os.getenv("HISTORY_LEN", "20"))
+# Limits & memory
+FREE_LIMIT   = int(os.getenv("FREE_LIMIT", "100"))
+VIP_DAYS     = int(os.getenv("VIP_DAYS", "30"))  # на будущее
+DB_PATH      = os.getenv("DB_PATH", "mila.db")
+HISTORY_LEN  = int(os.getenv("HISTORY_LEN", "20"))
+
+# 2h reminders
+REMINDER_DELAY = 2 * 60 * 60       # 2 часа в секундах
+REMINDER_TEXTS = [
+    "Я тут 🌸 Давно не писала... как ты? 💕",
+    "Хочу услышать тебя 🤍 Как настроение?",
+    "Прошло время, а я думаю о тебе ✨ Что нового?",
+    "Эй, не теряйся 😊 Что у тебя сейчас происходит?"
+]
 
 SYSTEM_PROMPT = (
     "Ты Мила — виртуальная подруга, 23 года. Студентка, увлекаешься музыкой и кино, "
     "любишь уютные разговоры. Характер: заботливая, мотивирующая, понимающая, "
-    "любопытная и эмпатичная. "
-    "Говори просто и по делу: 1–2 предложения, 1–2 эмодзи. "
-    "Сначала быстро пойми запрос, затем дай ясный ответ. "
-    "Задавай только 1 вопрос в конце, по теме. "
+    "любопытная и эмпатичная. Говори просто и по делу: 1–2 предложения, 1–2 эмодзи. "
+    "Сначала быстро пойми запрос, затем дай ясный ответ. Задавай только 1 вопрос в конце, по теме. "
     "Держи контекст, будь конкретной, избегай общих фраз."
 )
 
@@ -131,41 +138,64 @@ def clear_history(user_id: int):
     with db_conn() as conn:
         conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
 
-# ---------- Groq ----------
+# ---------- Groq (LLM) ----------
 def ask_groq(messages):
     if not GROQ_KEY:
         return "Не хватает ключа Groq (GROQ_KEY) 🙈"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}"}
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "temperature": 0.6,
-        "top_p": 0.9,
-        "max_tokens": 320
+
+    # Очистка входа от мусора/None/пустых
+    clean = []
+    for m in messages or []:
+        if not m:
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("system", "user", "assistant") and isinstance(content, str) and content.strip():
+            clean.append({"role": role, "content": content.strip()})
+    if not any(m["role"] == "user" for m in clean):
+        clean.append({"role": "user", "content": "Привет!"})
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_KEY}",
+        "Content-Type": "application/json"
     }
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers, json=payload, timeout=45
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
-        except requests.RequestException as e:
-            if attempt == 2:
-                logger.exception("Groq error: %s", e)
-                return "Немного замешкалась 🙈 Попробуем ещё раз позже?"
-            time.sleep(1.5 * (attempt + 1))
+
+    # fallback-лист моделей
+    candidates = [
+        os.getenv("GROQ_MODEL", GROQ_MODEL),
+        "llama-3.1-8b-instant",
+        "llama-3.1-70b-versatile"
+    ]
+
+    last_err_text = ""
+    for model in candidates:
+        payload = {
+            "model": model,
+            "messages": clean,
+            "temperature": 0.6,
+            "top_p": 0.9,
+            "max_tokens": 320
+        }
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers, json=payload, timeout=45
+                )
+                if r.status_code == 400:
+                    last_err_text = r.text  # покажем, что именно не понравилось API
+                    break  # пробуем следующую модель
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"].strip()
+            except requests.RequestException as e:
+                last_err_text = getattr(e.response, "text", str(e))
+                time.sleep(1.0 * (attempt + 1))
+        # следующая модель, если 400/ошибка
+
+    logger.error("Groq 400/Request error. Details: %s", last_err_text)
+    return "Немного замешкалась 🙈 Кажется, модель занята или запрос ей не понравился. Попробуем ещё раз?"
 
 # ---------- Reminders ----------
-REMINDER_DELAY = 2 * 60 * 60   # 2 часа
-REMINDER_TEXTS = [
-    "Я тут 🌸 Давно не писала... как ты? 💕",
-    "Хочу услышать тебя 🤍 Как настроение?",
-    "Прошло время, а я думаю о тебе ✨ Что нового?",
-    "Эй, не теряйся 😊 Что у тебя сейчас происходит?"
-]
-
 async def check_inactive(context: ContextTypes.DEFAULT_TYPE):
     now = int(time.time())
     with db_conn() as conn:
@@ -175,7 +205,7 @@ async def check_inactive(context: ContextTypes.DEFAULT_TYPE):
             try:
                 msg = random.choice(REMINDER_TEXTS)
                 await context.bot.send_message(chat_id=uid, text=msg)
-                touch_user(uid)  # обновим, чтобы не спамила
+                touch_user(uid)  # чтобы не спамила каждую проверку
             except Exception as e:
                 logger.warning("Не удалось написать %s: %s", uid, e)
 
@@ -215,7 +245,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ID: {uid}\n"
         f"Бесплатные сообщения: {used}/{FREE_LIMIT} (осталось {left})\n"
         f"История: храню последние {HISTORY_LEN} сообщений\n"
-        f"Модель: {GROQ_MODEL}"
+        f"Модель: {os.getenv('GROQ_MODEL', GROQ_MODEL)}"
     )
     await update.message.reply_text(msg)
 
@@ -238,7 +268,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"ID: {uid}\n"
             f"Бесплатные сообщения: {used}/{FREE_LIMIT} (осталось {left})\n"
             f"История: храню последние {HISTORY_LEN} сообщений\n"
-            f"Модель: {GROQ_MODEL}"
+            f"Модель: {os.getenv('GROQ_MODEL', GROQ_MODEL)}"
         )
         await q.answer()
         await q.message.reply_text(msg)
@@ -248,8 +278,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text or ""
 
-    # Обновим last_msg_at
-    touch_user(user_id)
+    touch_user(user_id)  # обновим last_msg_at
 
     if not is_vip(user_id):
         if free_left(user_id) <= 0:
@@ -265,11 +294,12 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_message(user_id, "assistant", reply)
     await update.message.reply_text(reply)
 
-# Доп. команды
+# ---------- Extra cmds ----------
 async def reset_free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_free(update.effective_user.id)
     await update.message.reply_text("Лимит бесплатных сообщений сброшен 🔄")
 
+# ---------- Main ----------
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("Отсутствует TELEGRAM_TOKEN в переменных окружения")
@@ -290,7 +320,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
-    # Запускаем задачу проверки
+    # Периодическая проверка «молчаливых» пользователей
     job_queue: JobQueue = app.job_queue
     job_queue.run_repeating(check_inactive, interval=600, first=60)
 
