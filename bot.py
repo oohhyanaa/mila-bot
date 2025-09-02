@@ -2,13 +2,14 @@ import os
 import logging
 import sqlite3
 import time
+import random
 import requests
 from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters, JobQueue
 )
 
 # -------- Logging --------
@@ -23,7 +24,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # Только Groq
 GROQ_KEY = os.getenv("GROQ_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")  # более умная модель
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
 
 # Ограничения
 FREE_LIMIT = int(os.getenv("FREE_LIMIT", "100"))
@@ -41,7 +42,6 @@ SYSTEM_PROMPT = (
     "Держи контекст, будь конкретной, избегай общих фраз."
 )
 
-# Пример для калибровки стиля (few-shot)
 EXAMPLE = [
     {"role": "user", "content": "Мне грустно, день какой-то тяжёлый."},
     {"role": "assistant", "content": "Сочувствую 🤍 Хочешь, я просто побуду рядом и помогу выговориться? Что больше всего давит сейчас?"}
@@ -55,7 +55,8 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             free_used INTEGER DEFAULT 0,
             vip_until INTEGER DEFAULT 0,
-            created_at INTEGER
+            created_at INTEGER,
+            last_msg_at INTEGER DEFAULT 0
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,14 +73,22 @@ def db_conn():
 def get_user(user_id: int):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT user_id, free_used, vip_until, created_at FROM users WHERE user_id=?", (user_id,))
+        c.execute("SELECT user_id, free_used, vip_until, created_at, last_msg_at FROM users WHERE user_id=?", (user_id,))
         row = c.fetchone()
         if not row:
             now = int(time.time())
-            c.execute("INSERT INTO users (user_id, free_used, vip_until, created_at) VALUES (?, 0, 0, ?)", (user_id, now))
+            c.execute(
+                "INSERT INTO users (user_id, free_used, vip_until, created_at, last_msg_at) VALUES (?, 0, 0, ?, ?)",
+                (user_id, now, now)
+            )
             conn.commit()
-            return (user_id, 0, 0, now)
+            return (user_id, 0, 0, now, now)
         return row
+
+def touch_user(user_id: int):
+    now = int(time.time())
+    with db_conn() as conn:
+        conn.execute("UPDATE users SET last_msg_at=? WHERE user_id=?", (now, user_id))
 
 def inc_free_used(user_id: int):
     with db_conn() as conn:
@@ -95,11 +104,11 @@ def reset_free(user_id: int):
         conn.execute("UPDATE users SET free_used=0 WHERE user_id=?", (user_id,))
 
 def is_vip(user_id: int) -> bool:
-    _, _, vip_until, _ = get_user(user_id)
+    _, _, vip_until, _, _ = get_user(user_id)
     return vip_until > int(time.time())
 
 def free_left(user_id: int) -> int:
-    _, used, _, _ = get_user(user_id)
+    _, used, _, _, _ = get_user(user_id)
     return max(0, FREE_LIMIT - used)
 
 def add_message(user_id: int, role: str, content: str):
@@ -148,6 +157,28 @@ def ask_groq(messages):
                 return "Немного замешкалась 🙈 Попробуем ещё раз позже?"
             time.sleep(1.5 * (attempt + 1))
 
+# ---------- Reminders ----------
+REMINDER_DELAY = 2 * 60 * 60   # 2 часа
+REMINDER_TEXTS = [
+    "Я тут 🌸 Давно не писала... как ты? 💕",
+    "Хочу услышать тебя 🤍 Как настроение?",
+    "Прошло время, а я думаю о тебе ✨ Что нового?",
+    "Эй, не теряйся 😊 Что у тебя сейчас происходит?"
+]
+
+async def check_inactive(context: ContextTypes.DEFAULT_TYPE):
+    now = int(time.time())
+    with db_conn() as conn:
+        rows = conn.execute("SELECT user_id, last_msg_at FROM users").fetchall()
+    for uid, last in rows:
+        if last and now - last > REMINDER_DELAY:
+            try:
+                msg = random.choice(REMINDER_TEXTS)
+                await context.bot.send_message(chat_id=uid, text=msg)
+                touch_user(uid)  # обновим, чтобы не спамила
+            except Exception as e:
+                logger.warning("Не удалось написать %s: %s", uid, e)
+
 # ---------- UI ----------
 def main_menu():
     kb = [
@@ -177,7 +208,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    uid, used, vip_until, created = get_user(user_id)
+    uid, used, vip_until, created, last = get_user(user_id)
     left = free_left(user_id)
     msg = (
         f"🧾 Профиль\n"
@@ -200,7 +231,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("История очищена 🧹")
         await q.message.reply_text("Начнём с чистого листа 🌸")
     elif data == "profile_cb":
-        uid, used, vip_until, created = get_user(user_id)
+        uid, used, vip_until, created, last = get_user(user_id)
         left = free_left(user_id)
         msg = (
             f"🧾 Профиль\n"
@@ -216,6 +247,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
     user_id = update.effective_user.id
     user_message = update.message.text or ""
+
+    # Обновим last_msg_at
+    touch_user(user_id)
 
     if not is_vip(user_id):
         if free_left(user_id) <= 0:
@@ -255,6 +289,10 @@ def main():
     app.add_handler(CommandHandler("reset_free", reset_free_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+
+    # Запускаем задачу проверки
+    job_queue: JobQueue = app.job_queue
+    job_queue.run_repeating(check_inactive, interval=600, first=60)
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
