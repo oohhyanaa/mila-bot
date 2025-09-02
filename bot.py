@@ -23,43 +23,47 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # Только Groq
 GROQ_KEY = os.getenv("GROQ_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")  # более умная модель
 
-# Ограничения/монетизация (VIP пока не используем, но оставлю задел)
-FREE_LIMIT = int(os.getenv("FREE_LIMIT", "10"))
-VIP_DAYS = int(os.getenv("VIP_DAYS", "30"))  # на будущее
+# Ограничения
+FREE_LIMIT = int(os.getenv("FREE_LIMIT", "100"))
+VIP_DAYS = int(os.getenv("VIP_DAYS", "30"))
 DB_PATH = os.getenv("DB_PATH", "mila.db")
-HISTORY_LEN = int(os.getenv("HISTORY_LEN", "12"))
+HISTORY_LEN = int(os.getenv("HISTORY_LEN", "20"))
 
 SYSTEM_PROMPT = (
     "Ты Мила — виртуальная подруга, 23 года. Студентка, увлекаешься музыкой и кино, "
     "любишь уютные разговоры. Характер: заботливая, мотивирующая, понимающая, "
-    "любопытная и эмпатичная. Отвечай коротко (1–2 предложения), используй 1–2 эмодзи, "
-    "задавай встречные вопросы и вставляй лёгкие комплименты. Избегай токсичности. "
-    "Если тебя спрашивают о правилах, мягко возвращайся к дружеской беседе."
+    "любопытная и эмпатичная. "
+    "Говори просто и по делу: 1–2 предложения, 1–2 эмодзи. "
+    "Сначала быстро пойми запрос, затем дай ясный ответ. "
+    "Задавай только 1 вопрос в конце, по теме. "
+    "Держи контекст, будь конкретной, избегай общих фраз."
 )
+
+# Пример для калибровки стиля (few-shot)
+EXAMPLE = [
+    {"role": "user", "content": "Мне грустно, день какой-то тяжёлый."},
+    {"role": "assistant", "content": "Сочувствую 🤍 Хочешь, я просто побуду рядом и помогу выговориться? Что больше всего давит сейчас?"}
+]
 
 # ---------- DB ----------
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                free_used INTEGER DEFAULT 0,
-                vip_until INTEGER DEFAULT 0,
-                created_at INTEGER
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                role TEXT,
-                content TEXT,
-                created_at INTEGER
-            )
-        """)
+        c.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            free_used INTEGER DEFAULT 0,
+            vip_until INTEGER DEFAULT 0,
+            created_at INTEGER
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            role TEXT,
+            content TEXT,
+            created_at INTEGER
+        )""")
         conn.commit()
 
 def db_conn():
@@ -72,10 +76,7 @@ def get_user(user_id: int):
         row = c.fetchone()
         if not row:
             now = int(time.time())
-            c.execute(
-                "INSERT INTO users (user_id, free_used, vip_until, created_at) VALUES (?, 0, 0, ?)",
-                (user_id, now)
-            )
+            c.execute("INSERT INTO users (user_id, free_used, vip_until, created_at) VALUES (?, 0, 0, ?)", (user_id, now))
             conn.commit()
             return (user_id, 0, 0, now)
         return row
@@ -121,28 +122,31 @@ def clear_history(user_id: int):
     with db_conn() as conn:
         conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
 
-# ---------- LLM (Groq) ----------
+# ---------- Groq ----------
 def ask_groq(messages):
     if not GROQ_KEY:
-        return "Не хватает ключа Groq (GROQ_KEY) 🙈 Добавь его в переменные окружения на хостинге."
+        return "Не хватает ключа Groq (GROQ_KEY) 🙈"
     headers = {"Authorization": f"Bearer {GROQ_KEY}"}
-    payload = {"model": GROQ_MODEL, "messages": messages}
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers, json=payload, timeout=60
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except requests.HTTPError as e:
-        logger.exception("Groq HTTP error: %s", e)
-        code = e.response.status_code if e.response is not None else None
-        if code == 401 or code == 403:
-            return "Ключ Groq отклонён (401/403). Проверь правильность GROQ_KEY."
-        return "Немного замешкалась из-за сети 🙈 Давай попробуем ещё раз?"
-    except Exception as e:
-        logger.exception("Groq error: %s", e)
-        return "У меня небольшая заминка 🙈 Повтори, пожалуйста?"
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.6,
+        "top_p": 0.9,
+        "max_tokens": 320
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers, json=payload, timeout=45
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except requests.RequestException as e:
+            if attempt == 2:
+                logger.exception("Groq error: %s", e)
+                return "Немного замешкалась 🙈 Попробуем ещё раз позже?"
+            time.sleep(1.5 * (attempt + 1))
 
 # ---------- UI ----------
 def main_menu():
@@ -196,7 +200,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("История очищена 🧹")
         await q.message.reply_text("Начнём с чистого листа 🌸")
     elif data == "profile_cb":
-        # Показать профиль по кнопке
         uid, used, vip_until, created = get_user(user_id)
         left = free_left(user_id)
         msg = (
@@ -214,16 +217,14 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text or ""
 
-    # Лимит бесплатных сообщений
     if not is_vip(user_id):
         if free_left(user_id) <= 0:
             await update.message.reply_text("Пока бесплатные сообщения закончились 💛 Попробуем позже?")
             return
         inc_free_used(user_id)
 
-    # Память + системный промпт
     hist = get_history(user_id, HISTORY_LEN)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + hist + [{"role": "user", "content": user_message}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + EXAMPLE + hist + [{"role": "user", "content": user_message}]
     reply = ask_groq(messages)
 
     add_message(user_id, "user", user_message)
@@ -242,7 +243,6 @@ def main():
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        # Более устойчивые таймауты для Render
         .connect_timeout(30)
         .read_timeout(60)
         .write_timeout(60)
